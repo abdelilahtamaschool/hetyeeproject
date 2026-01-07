@@ -67,3 +67,6 @@ logs/
 # Environment variables
 .env
 .env.local
+*.zip
+*.jsonl
+dataset.zip

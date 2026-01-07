@@ -159,7 +159,7 @@ def main():
 
     # Step 7: Evaluate on test set
     print("\n### Step 7: Final Evaluation on Sample Test Set ###")
-    test_results = classifier.evaluate(test_dataset)
+    test_results = classifier.evaluate(test_dataset, label_mapping_path="models/modernbert_sample/label_mapping.pkl")
 
     # Step 8: Save results
     print("\n### Step 8: Saving Results ###")

@@ -168,9 +168,50 @@ def evaluate_model(model, X, y_true, dataset_name: str = "Test"):
     print(f"  Recall:    {recall:.4f} (weighted)")
     print(f"  F1-Score:  {f1:.4f} (weighted)")
 
-    # Detailed classification report
-    print(f"\nDetailed Classification Report:")
-    print(classification_report(y_true, y_pred, zero_division=0))
+    # Calculate per-class metrics and display in table
+    print(f"\n{'='*80}")
+    print("F1-SCORES PER RECHTSGEBIED (LEGAL DOMAIN)")
+    print(f"{'='*80}")
+
+    # Calculate per-class metrics
+    precision_per_class = precision_score(y_true, y_pred, average=None, zero_division=0)
+    recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
+    f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+
+    # Get unique labels and their counts
+    import numpy as np
+    unique_labels = np.unique(y_true)
+
+    # Count support for each label
+    support_per_class = []
+    for label in unique_labels:
+        support_per_class.append(np.sum(y_true == label))
+
+    # Create table data
+    table_data = []
+    for idx, label in enumerate(unique_labels):
+        if idx < len(f1_per_class):
+            table_data.append({
+                'Rechtsgebied Code': f"Code {label}",
+                'Precision': f"{precision_per_class[idx]:.4f}",
+                'Recall': f"{recall_per_class[idx]:.4f}",
+                'F1-Score': f"{f1_per_class[idx]:.4f}",
+                'Support': int(support_per_class[idx])
+            })
+
+    # Create and display pandas DataFrame
+    df = pd.DataFrame(table_data)
+
+    # Sort by F1-Score (descending)
+    df['F1_numeric'] = df['F1-Score'].astype(float)
+    df = df.sort_values('F1_numeric', ascending=False)
+    df = df.drop('F1_numeric', axis=1)
+
+    print(f"\n{df.to_string(index=False)}")
+
+    print(f"\n{'='*80}")
+    print(f"Total rechtsgebieden: {len(table_data)}")
+    print(f"{'='*80}\n")
 
     metrics = {
         'accuracy': accuracy,

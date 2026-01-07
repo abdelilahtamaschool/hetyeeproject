@@ -3,17 +3,27 @@ ModernBERT Model Implementation for Kadaster Legal Document Classification
 
 This module implements ModernBERT (answerdotai/ModernBERT-base) with:
 - Extended context window (8192 tokens vs 512 for standard BERT)
-- GPU acceleration for RTX 4070
+- GPU acceleration for 8x RTX 5090
 - Flash Attention 2 support for improved performance
 - Optimized for long legal documents
+- Focal Loss for class imbalance handling
+- Class weighting support
 
 Model: answerdotai/ModernBERT-base
 Context: Up to 8192 tokens
-Hardware: NVIDIA RTX 4070
+Hardware: 8x NVIDIA RTX 5090 (270GB total VRAM)
+
+OPTIMIZATIONS (v2.0):
+- Focal Loss for minority class handling
+- Increased batch size (16 per GPU, 128 effective)
+- Lower learning rate (1e-5) for better convergence
+- More epochs (6) for complex classification
+- Proper multi-GPU training support
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoTokenizer,
@@ -25,12 +35,16 @@ from transformers import (
 )
 from typing import List, Dict, Optional, Tuple
 import numpy as np
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+from sklearn.utils.class_weight import compute_class_weight
 import warnings
+import pickle
+from pathlib import Path
+import pandas as pd
 
 
 class ModernBERTConfig:
-    """Configuration for ModernBERT model"""
+    """Configuration for ModernBERT model - Optimized for 8x RTX 5090"""
 
     # Model settings
     MODEL_NAME = "answerdotai/ModernBERT-base"
@@ -40,17 +54,111 @@ class ModernBERTConfig:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     USE_FLASH_ATTENTION = True  # Enable Flash Attention 2 if available
 
-    # Training settings - Optimized for RTX 4070 (12GB VRAM)
-    BATCH_SIZE = 4  # For GPU (use 2 for CPU)
-    GRADIENT_ACCUMULATION_STEPS = 8  # Effective batch size = 32 (use 4 for CPU)
-    LEARNING_RATE = 2e-5
-    NUM_EPOCHS = 3  # Full training (use 2 for quick tests)
-    WARMUP_STEPS = 500  # Full training (use 100 for small datasets)
+    # Training settings - OPTIMIZED FOR 8x RTX 5090 (270GB total VRAM)
+    BATCH_SIZE = 16  # Per GPU (8 GPUs × 16 = 128 effective batch size)
+    GRADIENT_ACCUMULATION_STEPS = 1  # Not needed with large batch size
+    LEARNING_RATE = 1e-5  # Lower for better convergence with many classes
+    NUM_EPOCHS = 6  # More epochs for 45 classes
+    WARMUP_STEPS = 1000  # More warmup for stability
     WEIGHT_DECAY = 0.01
-    FP16 = torch.cuda.is_available()  # Only use FP16 on CUDA
+    FP16 = torch.cuda.is_available()  # Mixed precision training
+    LABEL_SMOOTHING = 0.1  # Prevent overconfidence
+
+    # Class imbalance handling
+    USE_FOCAL_LOSS = True  # Enable Focal Loss for minority classes
+    FOCAL_ALPHA = 0.25  # Weight for positive class
+    FOCAL_GAMMA = 2.0  # Focus on hard examples
+    USE_CLASS_WEIGHTS = True  # Enable class weighting
 
     # Model checkpoint
-    SAVE_DIR = "models/modernbert"
+    SAVE_DIR = "models/modernbert_optimized"
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for handling class imbalance
+
+    Focal Loss focuses training on hard examples and down-weights easy examples.
+    This is crucial for legal document classification where some classes have very few samples.
+
+    Formula: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Args:
+        alpha: Weighting factor (default: 0.25)
+        gamma: Focusing parameter (default: 2.0)
+        reduction: Reduction method ('mean', 'sum', 'none')
+
+    Reference: Lin et al., "Focal Loss for Dense Object Detection" (2017)
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Calculate Focal Loss
+
+        Args:
+            inputs: Predictions (logits) from model [batch_size, num_classes]
+            targets: Ground truth labels [batch_size]
+
+        Returns:
+            Focal loss value
+        """
+        # Get probabilities
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        p_t = torch.exp(-ce_loss)
+
+        # Calculate focal loss
+        focal_loss = self.alpha * (1 - p_t) ** self.gamma * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+class WeightedTrainer(Trainer):
+    """
+    Custom Trainer with Focal Loss and class weighting support
+    """
+
+    def __init__(self, *args, class_weights=None, use_focal_loss=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.class_weights = class_weights
+        self.use_focal_loss = use_focal_loss
+
+        if self.use_focal_loss:
+            self.focal_loss = FocalLoss(
+                alpha=ModernBERTConfig.FOCAL_ALPHA,
+                gamma=ModernBERTConfig.FOCAL_GAMMA
+            )
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        Custom loss computation with Focal Loss and class weighting
+        """
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        # Use Focal Loss if enabled
+        if self.use_focal_loss:
+            loss = self.focal_loss(logits, labels)
+        else:
+            # Standard cross-entropy with class weights
+            if self.class_weights is not None:
+                weights = self.class_weights.to(logits.device)
+                loss = F.cross_entropy(logits, labels, weight=weights)
+            else:
+                loss = F.cross_entropy(logits, labels)
+
+        return (loss, outputs) if return_outputs else loss
 
 
 class LegalDocumentDataset(Dataset):
@@ -231,7 +339,7 @@ class ModernBERTClassifier:
               batch_size: int = ModernBERTConfig.BATCH_SIZE,
               learning_rate: float = ModernBERTConfig.LEARNING_RATE):
         """
-        Train the model
+        Train the model with Focal Loss and class weighting
 
         Args:
             train_dataset: Training dataset
@@ -242,10 +350,28 @@ class ModernBERTClassifier:
             learning_rate: Learning rate
         """
         print("\n" + "="*80)
-        print("TRAINING MODERNBERT MODEL")
+        print("TRAINING MODERNBERT MODEL (OPTIMIZED v2.0)")
         print("="*80)
 
-        # Training arguments optimized for RTX 4070
+        # Compute class weights for handling imbalance
+        class_weights = None
+        if ModernBERTConfig.USE_CLASS_WEIGHTS:
+            print("\nComputing class weights for imbalanced dataset...")
+            train_labels = np.array([train_dataset.labels[i] for i in range(len(train_dataset))])
+            unique_labels = np.unique(train_labels)
+
+            # Compute balanced weights
+            weights = compute_class_weight(
+                class_weight='balanced',
+                classes=unique_labels,
+                y=train_labels
+            )
+            class_weights = torch.FloatTensor(weights)
+
+            print(f"  Class weights computed for {len(unique_labels)} classes")
+            print(f"  Min weight: {weights.min():.4f}, Max weight: {weights.max():.4f}")
+
+        # Training arguments optimized for 8x RTX 5090
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=num_epochs,
@@ -256,41 +382,57 @@ class ModernBERTClassifier:
             weight_decay=ModernBERTConfig.WEIGHT_DECAY,
             warmup_steps=ModernBERTConfig.WARMUP_STEPS,
 
-            # Mixed precision for RTX 4070
+            # Mixed precision for RTX 5090
             fp16=ModernBERTConfig.FP16,
+
+            # Label smoothing to prevent overconfidence
+            label_smoothing_factor=ModernBERTConfig.LABEL_SMOOTHING,
 
             # Evaluation
             eval_strategy="steps",
-            eval_steps=200,
+            eval_steps=100,  # More frequent evaluation
             save_strategy="steps",
-            save_steps=200,
-            save_total_limit=3,
+            save_steps=100,
+            save_total_limit=5,  # Keep more checkpoints
             load_best_model_at_end=True,
-            metric_for_best_model="accuracy",
+            metric_for_best_model="f1",  # Optimize for F1 instead of accuracy
 
             # Logging
             logging_dir=f"{output_dir}/logs",
-            logging_steps=50,
+            logging_steps=25,  # More frequent logging
             report_to="none",  # Disable wandb/tensorboard
 
-            # Performance
-            dataloader_num_workers=0,  # Set to 0 for Windows compatibility
-            gradient_checkpointing=True,  # Save memory
+            # Performance - Optimized for 8 GPUs with 270GB VRAM
+            dataloader_num_workers=4,  # Use workers on Linux
+            gradient_checkpointing=False,  # Disable - we have enough VRAM
+            ddp_find_unused_parameters=False,  # For multi-GPU stability
 
             # Optimization
             optim="adamw_torch",
             lr_scheduler_type="cosine",
+            max_grad_norm=1.0,  # Gradient clipping
         )
 
-        # Initialize trainer
-        trainer = Trainer(
+        # Initialize trainer with Focal Loss or class weights
+        trainer = WeightedTrainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             compute_metrics=self.compute_metrics,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],  # More patience
+            class_weights=class_weights,
+            use_focal_loss=ModernBERTConfig.USE_FOCAL_LOSS
         )
+
+        print(f"\nTraining configuration:")
+        print(f"  Focal Loss: {'Enabled' if ModernBERTConfig.USE_FOCAL_LOSS else 'Disabled'}")
+        print(f"  Class Weighting: {'Enabled' if class_weights is not None else 'Disabled'}")
+        print(f"  Batch size per GPU: {batch_size}")
+        print(f"  Effective batch size: {batch_size * torch.cuda.device_count() if torch.cuda.is_available() else batch_size}")
+        print(f"  Learning rate: {learning_rate}")
+        print(f"  Epochs: {num_epochs}")
+        print(f"  Label smoothing: {ModernBERTConfig.LABEL_SMOOTHING}")
 
         # Train
         print("\nStarting training...")
@@ -310,13 +452,15 @@ class ModernBERTClassifier:
 
         return trainer
 
-    def evaluate(self, test_dataset: LegalDocumentDataset, batch_size: int = ModernBERTConfig.BATCH_SIZE):
+    def evaluate(self, test_dataset: LegalDocumentDataset, batch_size: int = ModernBERTConfig.BATCH_SIZE,
+                 label_mapping_path: Optional[str] = None):
         """
         Evaluate the model
 
         Args:
             test_dataset: Test dataset
             batch_size: Evaluation batch size
+            label_mapping_path: Path to label mapping pickle file (optional)
 
         Returns:
             Dictionary of evaluation metrics
@@ -367,11 +511,65 @@ class ModernBERTClassifier:
             'f1': f1
         }
 
-        print(f"\nTest Results:")
+        print(f"\nOverall Test Results:")
         print(f"  Accuracy:  {acc:.4f} ({acc*100:.2f}%)")
         print(f"  Precision: {precision:.4f}")
         print(f"  Recall:    {recall:.4f}")
         print(f"  F1-Score:  {f1:.4f}")
+
+        # Calculate per-class metrics and display in table
+        print(f"\n{'='*80}")
+        print("F1-SCORES PER RECHTSGEBIED (LEGAL DOMAIN)")
+        print(f"{'='*80}")
+
+        # Load label mapping if provided
+        id_to_label = None
+        if label_mapping_path and Path(label_mapping_path).exists():
+            try:
+                with open(label_mapping_path, 'rb') as f:
+                    mapping = pickle.load(f)
+                    id_to_label = mapping.get('id_to_label', None)
+            except:
+                pass
+
+        # Calculate per-class metrics
+        precision_per_class, recall_per_class, f1_per_class, support_per_class = precision_recall_fscore_support(
+            all_labels, all_preds, average=None, zero_division=0
+        )
+
+        # Create table data
+        table_data = []
+        unique_labels = sorted(np.unique(np.concatenate([all_labels, all_preds])))
+
+        for idx, label_id in enumerate(unique_labels):
+            if label_id < len(f1_per_class):
+                # Get label name if mapping exists
+                if id_to_label and label_id in id_to_label:
+                    label_name = f"Code {id_to_label[label_id]}"
+                else:
+                    label_name = f"Label {label_id}"
+
+                table_data.append({
+                    'Rechtsgebied Code': label_name,
+                    'Precision': f"{precision_per_class[label_id]:.4f}",
+                    'Recall': f"{recall_per_class[label_id]:.4f}",
+                    'F1-Score': f"{f1_per_class[label_id]:.4f}",
+                    'Support': int(support_per_class[label_id])
+                })
+
+        # Create and display pandas DataFrame
+        df = pd.DataFrame(table_data)
+
+        # Sort by F1-Score (descending)
+        df['F1_numeric'] = df['F1-Score'].astype(float)
+        df = df.sort_values('F1_numeric', ascending=False)
+        df = df.drop('F1_numeric', axis=1)
+
+        print(f"\n{df.to_string(index=False)}")
+
+        print(f"\n{'='*80}")
+        print(f"Total rechtsgebieden: {len(table_data)}")
+        print(f"{'='*80}\n")
 
         return results
 
