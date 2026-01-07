@@ -1,1 +1,37 @@
+# Data (te groot voor GitHub)
 ai-challenge-data_ai_challenge_data_anonymized_19744.jsonl
+*.jsonl
+
+# Model files (te groot voor GitHub - upload naar HuggingFace)
+*.safetensors
+optimizer.pt
+scheduler.pt
+scaler.pt
+rng_state.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Windows reserved names
+nul
+NUL

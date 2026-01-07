@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(powershell -Command \"Get-ChildItem -Path . -Recurse -File | Select-Object FullName | head -150\")",
+      "Bash(powershell:*)",
+      "Bash(python3:*)",
+      "mcp__MCP_DOCKER__resolve-library-id",
+      "mcp__MCP_DOCKER__get-library-docs",
+      "Bash(python:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(pip install:*)",
+      "WebFetch(domain:docs.vast.ai)",
+      "Bash(git add:*)"
+    ]
+  }
+}
