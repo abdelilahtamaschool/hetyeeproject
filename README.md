@@ -31,3 +31,10 @@ Omdat Engelse modellen vaak moeite hebben met Nederlandse nuances, focussen we o
     *   `transformers` (Hugging Face - voor BERTje/RobBERT)
     *   `torch` / `tensorflow` (Deep Learning backend)
     *   `spacy` (Voor NLP preprocessing)
+ 
+### MOET GEPUSHT
+
+Wat is NIET gepusht (te groot):
+  - ❌ model.safetensors (416 MB)
+  - ❌ optimizer.pt (833 MB)
+  - ❌ Training data .jsonl
