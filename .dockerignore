@@ -1,0 +1,57 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data (exclude raw data, keep processed splits)
+*.jsonl
+Datasets/raw/
+Datasets/*.jsonl
+
+# Models (will be generated during training)
+models/
+
+# Documentation
+*.md
+!requirements.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Analysis scripts
+analyze_*.py
+view_*.py
+generate_*.py
