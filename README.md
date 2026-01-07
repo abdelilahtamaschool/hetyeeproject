@@ -32,7 +32,7 @@ Omdat Engelse modellen vaak moeite hebben met Nederlandse nuances, focussen we o
     *   `torch` / `tensorflow` (Deep Learning backend)
     *   `spacy` (Voor NLP preprocessing)
  
-### MOET GEPUSHT
+### NIET GEPUSHT
 
 Wat is NIET gepusht (te groot):
   - ❌ model.safetensors (416 MB)
