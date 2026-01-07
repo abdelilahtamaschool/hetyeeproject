@@ -134,8 +134,6 @@ kadasterproject/
 ```
 
 
-### moet van docent ook geimplementeerd worden ###
-Voeg de carport en middenwoning ook toe aan het dashboard, deze blijken toch wel gunstig te zijn. 
-Eventueel ons dashboard verbeteren door te vergelijken met bestaande dashboards.
-Valideren doormiddel van backtesting blijkt goed te zijn. Ik merk dat de voorspelling in het grafiek op het dashboard te erg op 1 lijn lopen ipv de pieken goed te voorspellen
+### model gebruik ###
+ik wil graag dat je als eerst gebruik maakt van een moden bert model.
 
