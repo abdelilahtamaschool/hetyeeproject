@@ -5,7 +5,11 @@
       "Bash(python:*)",
       "Bash(cat:*)",
       "Bash(pip install:*)",
-      "Bash(docker build:*)"
+      "Bash(docker build:*)",
+      "Bash(git reset:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfeat: Optimize ModernBERT training \\(v2.0\\) - Focal Loss, class weighting, multi-GPU support\n\nMajor improvements to achieve 85-92% accuracy \\(vs 75% in v1.0\\):\n\n🚀 New Features:\n- Focal Loss for class imbalance handling\n- Class weighting for minority classes  \n- Optimized hyperparameters for 8x RTX 5090\n- Proper multi-GPU training with torch.distributed\n- Batch size 16 per GPU \\(128 effective\\)\n- Learning rate 1e-5 for better convergence\n- 6 epochs for 45-class problem\n\n📁 Files Added:\n- src/train_modernbert_optimized.py - New optimized training script\n- OPTIMIZATION.md - Complete analysis and documentation\n- OPTIMIZATIONS_README.md - Quick start guide\n- VASTAI-GUIDE.md - Updated with correct multi-GPU commands\n\n📝 Files Modified:\n- model.py - Added FocalLoss, WeightedTrainer, optimized config\n- src/train.py - Added per-class F1-score table\n- src/train_modernbert.py - Updated evaluate\\(\\) call\n- src/train_modernbert_sample.py - Updated evaluate\\(\\) call\n- .gitignore - Exclude large files \\(*.zip, *.jsonl\\)\n\n⚡ Performance:\n- Expected accuracy: 85-92% \\(vs 75.05% in v1.0\\)\n- Training time: 15-20 min \\(vs 41 min in v1.0\\)  \n- All 45 classes: F1 > 0.50 target\n- GPU efficiency: 90-95% \\(vs 40-60% in v1.0\\)\n\n🎯 Goal: Achieve 90% accuracy for Kadaster legal document classification\n\n🤖 Generated with Claude Code \\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)"
     ]
   }
 }
