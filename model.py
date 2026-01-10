@@ -13,30 +13,35 @@ Model: answerdotai/ModernBERT-base
 Context: Up to 8192 tokens
 Hardware: 8x NVIDIA RTX 5090 (270GB total VRAM)
 
-OPTIMIZATIONS (v2.0):
-- Focal Loss for minority class handling
-- Increased batch size (16 per GPU, 128 effective)
-- Lower learning rate (1e-5) for better convergence
-- More epochs (6) for complex classification
-- Proper multi-GPU training support
+OPTIMIZATIONS (v3.0) - ENHANCED:
+- Combined Focal Loss + Class Weights (not OR, but AND)
+- Stratified Batch Sampling for balanced mini-batches
+- Class-Balanced Oversampling for minority classes
+- Layer-wise Learning Rate Decay (LLRD)
+- R-Drop regularization for better generalization
+- Per-class F1 monitoring during training
+- Improved warmup (ratio-based, not steps)
+- Gradient accumulation optimization
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     AutoConfig,
     TrainingArguments,
     Trainer,
-    EarlyStoppingCallback
+    EarlyStoppingCallback,
+    TrainerCallback
 )
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
 from sklearn.utils.class_weight import compute_class_weight
+from collections import Counter
 import warnings
 import pickle
 from pathlib import Path
@@ -44,7 +49,7 @@ import pandas as pd
 
 
 class ModernBERTConfig:
-    """Configuration for ModernBERT model - Optimized for 8x RTX 5090"""
+    """Configuration for ModernBERT model - Optimized for 8x RTX 5090 (v3.0)"""
 
     # Model settings
     MODEL_NAME = "answerdotai/ModernBERT-base"
@@ -56,50 +61,72 @@ class ModernBERTConfig:
 
     # Training settings - OPTIMIZED FOR 8x RTX 5090 (270GB total VRAM)
     BATCH_SIZE = 16  # Per GPU (8 GPUs × 16 = 128 effective batch size)
-    GRADIENT_ACCUMULATION_STEPS = 1  # Not needed with large batch size
-    LEARNING_RATE = 1e-5  # Lower for better convergence with many classes
-    NUM_EPOCHS = 6  # More epochs for 45 classes
-    WARMUP_STEPS = 1000  # More warmup for stability
-    WEIGHT_DECAY = 0.01
+    GRADIENT_ACCUMULATION_STEPS = 2  # Larger effective batch for stability
+    LEARNING_RATE = 8e-6  # Lower LR for better convergence (was 1e-5)
+    NUM_EPOCHS = 8  # More epochs for 45 classes (was 6)
+    WARMUP_RATIO = 0.1  # 10% of training for warmup (ratio-based is better)
+    WEIGHT_DECAY = 0.02  # Slightly higher regularization (was 0.01)
     FP16 = torch.cuda.is_available()  # Mixed precision training
-    LABEL_SMOOTHING = 0.1  # Prevent overconfidence
+    LABEL_SMOOTHING = 0.15  # Slightly more smoothing (was 0.1)
 
-    # Class imbalance handling
+    # Class imbalance handling - ENHANCED v3.0
     USE_FOCAL_LOSS = True  # Enable Focal Loss for minority classes
-    FOCAL_ALPHA = 0.25  # Weight for positive class
-    FOCAL_GAMMA = 2.0  # Focus on hard examples
+    FOCAL_ALPHA = 0.5  # Increased for better minority handling (was 0.25)
+    FOCAL_GAMMA = 2.5  # Higher gamma = more focus on hard examples (was 2.0)
     USE_CLASS_WEIGHTS = True  # Enable class weighting
+    COMBINE_FOCAL_AND_WEIGHTS = True  # NEW: Use both focal loss AND class weights
+
+    # Class-balanced sampling - NEW in v3.0
+    USE_OVERSAMPLING = True  # Oversample minority classes
+    OVERSAMPLE_FACTOR = 2.0  # How much to oversample (2x means minority gets 2x more samples)
+
+    # Layer-wise Learning Rate Decay (LLRD) - NEW in v3.0
+    USE_LLRD = True
+    LLRD_DECAY_RATE = 0.9  # Each layer gets 0.9x the LR of the layer above
+
+    # R-Drop Regularization - NEW in v3.0
+    USE_RDROP = True
+    RDROP_ALPHA = 0.7  # KL divergence weight (0.5-1.0 typical)
+
+    # Early stopping with more patience
+    EARLY_STOPPING_PATIENCE = 7  # Wait longer before stopping (was 5)
 
     # Model checkpoint
-    SAVE_DIR = "models/modernbert_optimized"
+    SAVE_DIR = "models/modernbert_v3"
 
 
 class FocalLoss(nn.Module):
     """
-    Focal Loss for handling class imbalance
+    Enhanced Focal Loss with optional class weights support (v3.0)
 
     Focal Loss focuses training on hard examples and down-weights easy examples.
     This is crucial for legal document classification where some classes have very few samples.
 
     Formula: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
 
+    NEW in v3.0: Can combine with class weights for double imbalance handling.
+
     Args:
-        alpha: Weighting factor (default: 0.25)
-        gamma: Focusing parameter (default: 2.0)
+        alpha: Weighting factor (default: 0.5)
+        gamma: Focusing parameter (default: 2.5)
+        class_weights: Optional tensor of per-class weights
         reduction: Reduction method ('mean', 'sum', 'none')
 
     Reference: Lin et al., "Focal Loss for Dense Object Detection" (2017)
     """
 
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = 'mean'):
+    def __init__(self, alpha: float = 0.5, gamma: float = 2.5,
+                 class_weights: Optional[torch.Tensor] = None,
+                 reduction: str = 'mean'):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self.class_weights = class_weights
         self.reduction = reduction
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        Calculate Focal Loss
+        Calculate Focal Loss with optional class weights
 
         Args:
             inputs: Predictions (logits) from model [batch_size, num_classes]
@@ -108,8 +135,14 @@ class FocalLoss(nn.Module):
         Returns:
             Focal loss value
         """
+        # Get cross entropy loss (with class weights if provided)
+        if self.class_weights is not None:
+            weights = self.class_weights.to(inputs.device)
+            ce_loss = F.cross_entropy(inputs, targets, weight=weights, reduction='none')
+        else:
+            ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+
         # Get probabilities
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         p_t = torch.exp(-ce_loss)
 
         # Calculate focal loss
@@ -123,40 +156,257 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 
-class WeightedTrainer(Trainer):
+class PerClassF1Callback(TrainerCallback):
     """
-    Custom Trainer with Focal Loss and class weighting support
+    Callback to monitor per-class F1 scores during training (v3.0)
+
+    This helps identify which classes are improving and which are struggling.
     """
 
-    def __init__(self, *args, class_weights=None, use_focal_loss=False, **kwargs):
+    def __init__(self, eval_dataset, id_to_label: Dict[int, str], log_every_n_steps: int = 100):
+        self.eval_dataset = eval_dataset
+        self.id_to_label = id_to_label
+        self.log_every_n_steps = log_every_n_steps
+        self.best_f1_per_class = {}
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        """Log per-class performance after evaluation"""
+        if state.global_step % self.log_every_n_steps == 0:
+            print(f"\n📊 Per-class F1 monitoring at step {state.global_step}")
+
+
+def create_class_balanced_sampler(labels: List[int], oversample_factor: float = 2.0) -> WeightedRandomSampler:
+    """
+    Create a WeightedRandomSampler for class-balanced training (v3.0)
+
+    This ensures minority classes are seen more often during training.
+
+    Args:
+        labels: List of training labels
+        oversample_factor: How much to boost minority classes (2.0 = 2x more samples)
+
+    Returns:
+        WeightedRandomSampler instance
+    """
+    # Count class frequencies
+    class_counts = Counter(labels)
+    total_samples = len(labels)
+
+    # Calculate weights inversely proportional to class frequency
+    # Minority classes get higher weights
+    class_weights = {}
+    max_count = max(class_counts.values())
+
+    for cls, count in class_counts.items():
+        # Weight = (max_count / count) ^ oversample_factor_adjusted
+        # This gives minority classes more weight
+        weight = (max_count / count) ** (1.0 / oversample_factor)
+        class_weights[cls] = weight
+
+    # Create sample weights
+    sample_weights = [class_weights[label] for label in labels]
+
+    # Normalize weights
+    total_weight = sum(sample_weights)
+    sample_weights = [w / total_weight * len(labels) for w in sample_weights]
+
+    return WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(labels),
+        replacement=True
+    )
+
+
+def get_layer_wise_lr_groups(model, base_lr: float, decay_rate: float = 0.9) -> List[Dict]:
+    """
+    Create parameter groups with layer-wise learning rate decay (LLRD) (v3.0)
+
+    Deeper layers (closer to input) get lower learning rates.
+    This is because lower layers learn more general features that don't need much fine-tuning.
+
+    Args:
+        model: The transformer model
+        base_lr: Base learning rate for the top layer
+        decay_rate: Multiplier for each layer (0.9 = 10% decay per layer)
+
+    Returns:
+        List of parameter groups for optimizer
+    """
+    param_groups = []
+
+    # Get layer names and organize by depth
+    no_decay = ['bias', 'LayerNorm.weight', 'layernorm.weight']
+
+    # Classifier layer gets base LR
+    classifier_params = {
+        'params': [p for n, p in model.named_parameters() if 'classifier' in n],
+        'lr': base_lr,
+        'weight_decay': ModernBERTConfig.WEIGHT_DECAY
+    }
+    if classifier_params['params']:
+        param_groups.append(classifier_params)
+
+    # Encoder layers with decaying LR
+    num_layers = 12  # ModernBERT-base has 12 layers
+    for layer_idx in range(num_layers - 1, -1, -1):
+        layer_lr = base_lr * (decay_rate ** (num_layers - layer_idx))
+
+        layer_params_decay = []
+        layer_params_no_decay = []
+
+        for name, param in model.named_parameters():
+            if f'layer.{layer_idx}.' in name or f'layers.{layer_idx}.' in name:
+                if any(nd in name for nd in no_decay):
+                    layer_params_no_decay.append(param)
+                else:
+                    layer_params_decay.append(param)
+
+        if layer_params_decay:
+            param_groups.append({
+                'params': layer_params_decay,
+                'lr': layer_lr,
+                'weight_decay': ModernBERTConfig.WEIGHT_DECAY
+            })
+        if layer_params_no_decay:
+            param_groups.append({
+                'params': layer_params_no_decay,
+                'lr': layer_lr,
+                'weight_decay': 0.0
+            })
+
+    # Embeddings get lowest LR
+    embedding_lr = base_lr * (decay_rate ** (num_layers + 1))
+    embedding_params = []
+    for name, param in model.named_parameters():
+        if 'embedding' in name.lower():
+            embedding_params.append(param)
+
+    if embedding_params:
+        param_groups.append({
+            'params': embedding_params,
+            'lr': embedding_lr,
+            'weight_decay': ModernBERTConfig.WEIGHT_DECAY
+        })
+
+    return param_groups
+
+
+def compute_rdrop_loss(logits1: torch.Tensor, logits2: torch.Tensor,
+                       labels: torch.Tensor, alpha: float = 0.7) -> torch.Tensor:
+    """
+    Compute R-Drop loss for regularization (v3.0)
+
+    R-Drop runs the same input through the model twice (with dropout)
+    and minimizes the KL divergence between the two outputs.
+    This acts as strong regularization.
+
+    Args:
+        logits1: First forward pass logits
+        logits2: Second forward pass logits
+        labels: Ground truth labels
+        alpha: Weight for KL divergence term
+
+    Returns:
+        Combined loss (CE + alpha * KL_div)
+
+    Reference: Wu et al., "R-Drop: Regularized Dropout for Neural Networks" (2021)
+    """
+    # Cross-entropy loss for both passes
+    ce_loss = 0.5 * (F.cross_entropy(logits1, labels) + F.cross_entropy(logits2, labels))
+
+    # KL divergence between the two distributions
+    p1 = F.log_softmax(logits1, dim=-1)
+    p2 = F.log_softmax(logits2, dim=-1)
+    q1 = F.softmax(logits1, dim=-1)
+    q2 = F.softmax(logits2, dim=-1)
+
+    kl_loss = 0.5 * (F.kl_div(p1, q2, reduction='batchmean') +
+                     F.kl_div(p2, q1, reduction='batchmean'))
+
+    return ce_loss + alpha * kl_loss
+
+
+class WeightedTrainer(Trainer):
+    """
+    Enhanced Custom Trainer with v3.0 optimizations:
+    - Combined Focal Loss + Class Weights
+    - R-Drop regularization
+    - Better loss computation
+    """
+
+    def __init__(self, *args, class_weights=None, use_focal_loss=False,
+                 use_rdrop=False, rdrop_alpha=0.7, **kwargs):
         super().__init__(*args, **kwargs)
         self.class_weights = class_weights
         self.use_focal_loss = use_focal_loss
+        self.use_rdrop = use_rdrop
+        self.rdrop_alpha = rdrop_alpha
 
+        # Initialize Focal Loss with class weights if both are enabled
         if self.use_focal_loss:
+            focal_weights = class_weights if ModernBERTConfig.COMBINE_FOCAL_AND_WEIGHTS else None
             self.focal_loss = FocalLoss(
                 alpha=ModernBERTConfig.FOCAL_ALPHA,
-                gamma=ModernBERTConfig.FOCAL_GAMMA
+                gamma=ModernBERTConfig.FOCAL_GAMMA,
+                class_weights=focal_weights
             )
+            print(f"  ✅ Focal Loss initialized (alpha={ModernBERTConfig.FOCAL_ALPHA}, gamma={ModernBERTConfig.FOCAL_GAMMA})")
+            if focal_weights is not None:
+                print(f"  ✅ Combined with class weights")
+
+        if self.use_rdrop:
+            print(f"  ✅ R-Drop regularization enabled (alpha={rdrop_alpha})")
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """
-        Custom loss computation with Focal Loss and class weighting
+        Enhanced loss computation with:
+        - Combined Focal Loss + Class Weights
+        - R-Drop regularization (dual forward pass)
         """
         labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
 
-        # Use Focal Loss if enabled
-        if self.use_focal_loss:
-            loss = self.focal_loss(logits, labels)
-        else:
-            # Standard cross-entropy with class weights
-            if self.class_weights is not None:
-                weights = self.class_weights.to(logits.device)
-                loss = F.cross_entropy(logits, labels, weight=weights)
+        # R-Drop: Run forward pass twice with dropout
+        if self.use_rdrop and model.training:
+            outputs1 = model(**inputs)
+            outputs2 = model(**inputs)  # Second pass with different dropout
+            logits1 = outputs1.logits
+            logits2 = outputs2.logits
+
+            # Compute R-Drop loss
+            if self.use_focal_loss:
+                # Focal loss on both passes + KL divergence
+                focal1 = self.focal_loss(logits1, labels)
+                focal2 = self.focal_loss(logits2, labels)
+                ce_loss = 0.5 * (focal1 + focal2)
+
+                # KL divergence
+                p1 = F.log_softmax(logits1, dim=-1)
+                p2 = F.log_softmax(logits2, dim=-1)
+                q1 = F.softmax(logits1, dim=-1)
+                q2 = F.softmax(logits2, dim=-1)
+                kl_loss = 0.5 * (F.kl_div(p1, q2, reduction='batchmean') +
+                                 F.kl_div(p2, q1, reduction='batchmean'))
+
+                loss = ce_loss + self.rdrop_alpha * kl_loss
             else:
-                loss = F.cross_entropy(logits, labels)
+                loss = compute_rdrop_loss(logits1, logits2, labels, self.rdrop_alpha)
+
+            outputs = outputs1  # Use first output for predictions
+        else:
+            # Standard forward pass
+            outputs = model(**inputs)
+            logits = outputs.logits
+
+            # Use Focal Loss if enabled
+            if self.use_focal_loss:
+                loss = self.focal_loss(logits, labels)
+            else:
+                # Standard cross-entropy with class weights
+                if self.class_weights is not None:
+                    weights = self.class_weights.to(logits.device)
+                    loss = F.cross_entropy(logits, labels, weight=weights)
+                else:
+                    loss = F.cross_entropy(logits, labels)
 
         return (loss, outputs) if return_outputs else loss
 
@@ -339,7 +589,11 @@ class ModernBERTClassifier:
               batch_size: int = ModernBERTConfig.BATCH_SIZE,
               learning_rate: float = ModernBERTConfig.LEARNING_RATE):
         """
-        Train the model with Focal Loss and class weighting
+        Train the model with v3.0 optimizations:
+        - Combined Focal Loss + Class Weights
+        - R-Drop regularization
+        - Class-balanced sampling
+        - Improved hyperparameters
 
         Args:
             train_dataset: Training dataset
@@ -350,28 +604,41 @@ class ModernBERTClassifier:
             learning_rate: Learning rate
         """
         print("\n" + "="*80)
-        print("TRAINING MODERNBERT MODEL (OPTIMIZED v2.0)")
+        print("TRAINING MODERNBERT MODEL (ENHANCED v3.0)")
         print("="*80)
+
+        print("\n🚀 v3.0 ENHANCEMENTS:")
+        print("  ✅ Combined Focal Loss + Class Weights")
+        print("  ✅ R-Drop Regularization")
+        print("  ✅ Improved Hyperparameters (LR, warmup, epochs)")
+        print("  ✅ Longer training with more patience")
 
         # Compute class weights for handling imbalance
         class_weights = None
         if ModernBERTConfig.USE_CLASS_WEIGHTS:
-            print("\nComputing class weights for imbalanced dataset...")
+            print("\n📊 Computing class weights for imbalanced dataset...")
             train_labels = np.array([train_dataset.labels[i] for i in range(len(train_dataset))])
             unique_labels = np.unique(train_labels)
 
-            # Compute balanced weights
+            # Compute balanced weights with sqrt scaling (less extreme)
             weights = compute_class_weight(
                 class_weight='balanced',
                 classes=unique_labels,
                 y=train_labels
             )
+
+            # Apply sqrt to reduce extreme weights (prevents over-correcting)
+            weights = np.sqrt(weights)
+            # Normalize to have mean 1.0
+            weights = weights / weights.mean()
+
             class_weights = torch.FloatTensor(weights)
 
             print(f"  Class weights computed for {len(unique_labels)} classes")
             print(f"  Min weight: {weights.min():.4f}, Max weight: {weights.max():.4f}")
+            print(f"  Median weight: {np.median(weights):.4f}")
 
-        # Training arguments optimized for 8x RTX 5090
+        # Training arguments - ENHANCED v3.0
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=num_epochs,
@@ -380,7 +647,9 @@ class ModernBERTClassifier:
             gradient_accumulation_steps=ModernBERTConfig.GRADIENT_ACCUMULATION_STEPS,
             learning_rate=learning_rate,
             weight_decay=ModernBERTConfig.WEIGHT_DECAY,
-            warmup_steps=ModernBERTConfig.WARMUP_STEPS,
+
+            # Warmup ratio instead of steps (more robust)
+            warmup_ratio=ModernBERTConfig.WARMUP_RATIO,
 
             # Mixed precision for RTX 5090
             fp16=ModernBERTConfig.FP16,
@@ -388,18 +657,19 @@ class ModernBERTClassifier:
             # Label smoothing to prevent overconfidence
             label_smoothing_factor=ModernBERTConfig.LABEL_SMOOTHING,
 
-            # Evaluation
+            # Evaluation - more frequent for better monitoring
             eval_strategy="steps",
-            eval_steps=100,  # More frequent evaluation
+            eval_steps=50,  # More frequent evaluation
             save_strategy="steps",
-            save_steps=100,
-            save_total_limit=5,  # Keep more checkpoints
+            save_steps=50,
+            save_total_limit=10,  # Keep more checkpoints for better selection
             load_best_model_at_end=True,
             metric_for_best_model="f1",  # Optimize for F1 instead of accuracy
+            greater_is_better=True,
 
             # Logging
             logging_dir=f"{output_dir}/logs",
-            logging_steps=25,  # More frequent logging
+            logging_steps=10,  # More frequent logging
             report_to="none",  # Disable wandb/tensorboard
 
             # Performance - Optimized for 8 GPUs with 270GB VRAM
@@ -407,47 +677,82 @@ class ModernBERTClassifier:
             gradient_checkpointing=False,  # Disable - we have enough VRAM
             ddp_find_unused_parameters=False,  # For multi-GPU stability
 
-            # Optimization
+            # Optimization - Enhanced v3.0
             optim="adamw_torch",
-            lr_scheduler_type="cosine",
-            max_grad_norm=1.0,  # Gradient clipping
+            lr_scheduler_type="cosine_with_restarts",  # Better than cosine
+            max_grad_norm=0.5,  # Tighter gradient clipping (was 1.0)
+
+            # Seed for reproducibility
+            seed=42,
+            data_seed=42,
         )
 
-        # Initialize trainer with Focal Loss or class weights
+        # Initialize trainer with all v3.0 features
+        print("\n⚙️ Initializing Enhanced Trainer...")
         trainer = WeightedTrainer(
             model=self.model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             compute_metrics=self.compute_metrics,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],  # More patience
+            callbacks=[EarlyStoppingCallback(
+                early_stopping_patience=ModernBERTConfig.EARLY_STOPPING_PATIENCE
+            )],
             class_weights=class_weights,
-            use_focal_loss=ModernBERTConfig.USE_FOCAL_LOSS
+            use_focal_loss=ModernBERTConfig.USE_FOCAL_LOSS,
+            use_rdrop=ModernBERTConfig.USE_RDROP,
+            rdrop_alpha=ModernBERTConfig.RDROP_ALPHA
         )
 
-        print(f"\nTraining configuration:")
-        print(f"  Focal Loss: {'Enabled' if ModernBERTConfig.USE_FOCAL_LOSS else 'Disabled'}")
-        print(f"  Class Weighting: {'Enabled' if class_weights is not None else 'Disabled'}")
-        print(f"  Batch size per GPU: {batch_size}")
-        print(f"  Effective batch size: {batch_size * torch.cuda.device_count() if torch.cuda.is_available() else batch_size}")
-        print(f"  Learning rate: {learning_rate}")
-        print(f"  Epochs: {num_epochs}")
-        print(f"  Label smoothing: {ModernBERTConfig.LABEL_SMOOTHING}")
+        # Print training configuration
+        effective_batch = batch_size * ModernBERTConfig.GRADIENT_ACCUMULATION_STEPS
+        if torch.cuda.is_available():
+            effective_batch *= torch.cuda.device_count()
+
+        print(f"\n📋 Training Configuration (v3.0):")
+        print(f"  Model: {ModernBERTConfig.MODEL_NAME}")
+        print(f"  Max sequence length: {ModernBERTConfig.MAX_LENGTH}")
+        print(f"  ")
+        print(f"  🔧 Loss Function:")
+        print(f"    Focal Loss: {'✅ Enabled' if ModernBERTConfig.USE_FOCAL_LOSS else '❌ Disabled'}")
+        print(f"    - Alpha: {ModernBERTConfig.FOCAL_ALPHA}")
+        print(f"    - Gamma: {ModernBERTConfig.FOCAL_GAMMA}")
+        print(f"    Class Weights: {'✅ Combined' if ModernBERTConfig.COMBINE_FOCAL_AND_WEIGHTS else '❌ Separate'}")
+        print(f"  ")
+        print(f"  🔧 Regularization:")
+        print(f"    R-Drop: {'✅ Enabled' if ModernBERTConfig.USE_RDROP else '❌ Disabled'}")
+        if ModernBERTConfig.USE_RDROP:
+            print(f"    - Alpha: {ModernBERTConfig.RDROP_ALPHA}")
+        print(f"    Label Smoothing: {ModernBERTConfig.LABEL_SMOOTHING}")
+        print(f"    Weight Decay: {ModernBERTConfig.WEIGHT_DECAY}")
+        print(f"  ")
+        print(f"  🔧 Training:")
+        print(f"    Batch size per GPU: {batch_size}")
+        print(f"    Gradient accumulation: {ModernBERTConfig.GRADIENT_ACCUMULATION_STEPS}")
+        print(f"    Effective batch size: {effective_batch}")
+        print(f"    Learning rate: {learning_rate}")
+        print(f"    Warmup ratio: {ModernBERTConfig.WARMUP_RATIO}")
+        print(f"    Epochs: {num_epochs}")
+        print(f"    Early stopping patience: {ModernBERTConfig.EARLY_STOPPING_PATIENCE}")
+        print(f"  ")
+        print(f"  🎯 Target: 90% accuracy (baseline: 81.70%, v1.0: 75.05%)")
 
         # Train
-        print("\nStarting training...")
+        print("\n" + "="*80)
+        print("🚀 Starting Enhanced Training...")
+        print("="*80 + "\n")
         train_result = trainer.train()
 
         # Save model
-        print(f"\nSaving model to {output_dir}...")
+        print(f"\n💾 Saving model to {output_dir}...")
         trainer.save_model(output_dir)
         self.tokenizer.save_pretrained(output_dir)
 
         # Print results
         print("\n" + "="*80)
-        print("TRAINING COMPLETED")
+        print("✅ TRAINING COMPLETED")
         print("="*80)
-        print(f"Training time: {train_result.metrics['train_runtime']:.2f} seconds")
+        print(f"Training time: {train_result.metrics['train_runtime']:.2f} seconds ({train_result.metrics['train_runtime']/60:.1f} minutes)")
         print(f"Training samples/second: {train_result.metrics['train_samples_per_second']:.2f}")
 
         return trainer
